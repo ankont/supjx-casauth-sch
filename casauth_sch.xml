@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<extension type="plugin" group="authentication" method="upgrade" version="5.0">
+    <name>PLG_AUTHENTICATION_CASAUTH_SCH</name>
+    <author>Andreas Kontarinis &amp; ChatGPT</author>
+    <creationDate>2025-09-26</creationDate>
+    <version>1.0.0</version>
+    <description>PLG_AUTHENTICATION_CASAUTH_SCH_XML_DESCRIPTION</description>
+    <element>casauth_sch</element>
+    <namespace path="src">SuperSoft\Plugin\Authentication\CasauthSch</namespace>
+    <files>
+        <folder plugin="casauth_sch">services</folder>
+        <folder>src</folder>
+        <folder>language</folder>
+        <filename>README.md</filename>
+        <filename>composer.json</filename>
+    </files>
+    <config>
+        <fields name="params">
+            <fieldset name="basic">
+                <field name="frontend_only" type="radio" default="1" label="PLG_AUTH_CASAUTH_SCH_FRONTEND_ONLY" description="PLG_AUTH_CASAUTH_SCH_FRONTEND_ONLY_DESC">
+                    <option value="1">JYES</option>
+                    <option value="0">JNO</option>
+                </field>
+                <field name="host" type="text" default="sso.sch.gr" label="PLG_AUTH_CASAUTH_SCH_HOST" required="true"/>
+                <field name="port" type="number" default="443" label="PLG_AUTH_CASAUTH_SCH_PORT" required="true"/>
+                <field name="context" type="text" default="/cas" label="PLG_AUTH_CASAUTH_SCH_CONTEXT" required="true"/>
+                <field name="version" type="list" default="3.0" label="PLG_AUTH_CASAUTH_SCH_VERSION">
+                    <option value="2.0">2.0</option>
+                    <option value="3.0">3.0</option>
+                </field>
+                <field name="validate_ssl" type="radio" default="1" label="PLG_AUTH_CASAUTH_SCH_VALIDATE_SSL">
+                    <option value="1">JYES</option>
+                    <option value="0">JNO</option>
+                </field>
+                <field name="ca_cert" type="text" label="PLG_AUTH_CASAUTH_SCH_CA_CERT" description="PLG_AUTH_CASAUTH_SCH_CA_CERT_DESC"/>
+                <field name="service_url" type="text" label="PLG_AUTH_CASAUTH_SCH_SERVICE_URL" description="PLG_AUTH_CASAUTH_SCH_SERVICE_URL_DESC"/>
+                <field name="username_attribute" type="text" label="PLG_AUTH_CASAUTH_SCH_USERNAME_ATTRIBUTE" description="PLG_AUTH_CASAUTH_SCH_USERNAME_ATTRIBUTE_DESC"/>
+                <field name="mail_attribute" type="text" default="mail" label="PLG_AUTH_CASAUTH_SCH_MAIL_ATTRIBUTE"/>
+                <field name="fullname_attribute" type="text" label="PLG_AUTH_CASAUTH_SCH_FULLNAME_ATTRIBUTE"/>
+                <field name="auto_create" type="radio" default="1" label="PLG_AUTH_CASAUTH_SCH_AUTO_CREATE">
+                    <option value="1">JYES</option>
+                    <option value="0">JNO</option>
+                </field>
+                <field name="default_group" type="usergrouplist" default="2" label="PLG_AUTH_CASAUTH_SCH_DEFAULT_GROUP"/>
+                <field name="logout_url" type="text" default="https://sso-01.sch.gr/logout" label="PLG_AUTH_CASAUTH_SCH_LOGOUT_URL" description="PLG_AUTH_CASAUTH_SCH_LOGOUT_URL_DESC"/>
+            </fieldset>
+        </fields>
+    </config>
+    <languages>
+        <language tag="en-GB">language/en-GB/en-GB.plg_authentication_casauth_sch.ini</language>
+        <language tag="en-GB">language/en-GB/en-GB.plg_authentication_casauth_sch.sys.ini</language>
+        <language tag="el-GR">language/el-GR/el-GR.plg_authentication_casauth_sch.ini</language>
+        <language tag="el-GR">language/el-GR/el-GR.plg_authentication_casauth_sch.sys.ini</language>
+    </languages>
+</extension>
