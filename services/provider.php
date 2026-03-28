@@ -7,7 +7,7 @@ use Joomla\CMS\Plugin\PluginHelper;
 use Joomla\DI\Container;
 use Joomla\DI\ServiceProviderInterface;
 use Joomla\Registry\Registry;
-use SuperSoft\Plugin\Authentication\CasauthSch\Extension\CasauthSch;
+use SuperSoft\Plugin\System\CasAuthSch\Extension\CasAuthSch;
 
 return new class() implements ServiceProviderInterface {
     public function register(Container $container): void
@@ -15,13 +15,13 @@ return new class() implements ServiceProviderInterface {
         $container->set(
             PluginInterface::class,
             function (Container $container) {
-                $pluginRecord = PluginHelper::getPlugin('authentication', 'casauth_sch');
+                $pluginRecord = PluginHelper::getPlugin('system', 'casauth_sch');
                 $params = new Registry($pluginRecord->params ?? '');
 
-                $plugin = new CasauthSch(
+                $plugin = new CasAuthSch(
                     [
                         'name' => 'casauth_sch',
-                        'type' => 'authentication',
+                        'type' => 'system',
                         'params' => $params,
                     ]
                 );

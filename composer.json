@@ -1,11 +1,11 @@
 {
   "name": "ankont/plg_casauth_sch",
   "type": "joomla-plugin",
-  "description": "CASAuth SCH authentication plugin for Joomla 5.4 / 6.0 using phpCAS",
+  "description": "CASAuth SCH frontend SSO plugin for Joomla 5.4 / 6.0 using phpCAS",
   "license": "MIT",
   "require": {
     "php": ">=8.1",
-    "apereo/phpcas": "^1.6"
+    "apereo/phpcas": "1.6.1"
   },
   "autoload": {
     "psr-4": {}
