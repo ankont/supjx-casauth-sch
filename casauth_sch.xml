@@ -3,7 +3,7 @@
     <name>PLG_SYSTEM_CASAUTH_SCH</name>
     <author>Andreas Kontarinis &amp; ChatGPT</author>
     <creationDate>2025-09-26</creationDate>
-    <version>1.3.1</version>
+    <version>1.4.6</version>
     <description>PLG_SYSTEM_CASAUTH_SCH_XML_DESCRIPTION</description>
     <element>casauth_sch</element>
     <namespace path="src">SuperSoft\Plugin\System\CasAuthSch</namespace>
@@ -20,6 +20,10 @@
         <fields name="params">
             <fieldset name="basic">
                 <field name="auto_redirect_login" type="radio" class="btn-group btn-group-yesno" layout="joomla.form.field.radio.buttons" default="0" label="PLG_SYSTEM_CASAUTH_SCH_AUTO_REDIRECT_LOGIN" description="PLG_SYSTEM_CASAUTH_SCH_AUTO_REDIRECT_LOGIN_DESC">
+                    <option value="0">JNO</option>
+                    <option value="1">JYES</option>
+                </field>
+                <field name="enable_admin_sso" type="radio" class="btn-group btn-group-yesno" layout="joomla.form.field.radio.buttons" default="0" label="PLG_SYSTEM_CASAUTH_SCH_ENABLE_ADMIN_SSO" description="PLG_SYSTEM_CASAUTH_SCH_ENABLE_ADMIN_SSO_DESC">
                     <option value="0">JNO</option>
                     <option value="1">JYES</option>
                 </field>

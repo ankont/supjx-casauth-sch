@@ -51,7 +51,11 @@ final class CasAuthSch extends CMSPlugin implements SubscriberInterface
     private const FLOW_LOG_CATEGORY = 'casauth_sch.flow';
     private const LOG_FILE = 'plg_system_casauth_sch.php';
     private const SESSION_UI_ERROR = 'casauth_sch.ui_error';
+    private const SESSION_RETURN = 'casauth_sch.return';
+    private const SESSION_IS_SSO = 'casauth_sch.is_sso';
+    private const SESSION_ADMIN_INTENT = 'casauth_sch.admin_intent';
     private const UI_ERROR_QUERY_PARAM = 'casauth_sch_ui_error';
+    private const ADMIN_INTENT_QUERY_PARAM = 'casauth_sch_admin';
 
     private static bool $loggerConfigured = false;
 
@@ -75,7 +79,38 @@ final class CasAuthSch extends CMSPlugin implements SubscriberInterface
     {
         $app = $event->getApplication();
 
-        if (!$app instanceof CMSApplicationInterface || !$app->isClient('site')) {
+        if (!$app instanceof CMSApplicationInterface) {
+            return;
+        }
+
+        if ($app->isClient('administrator')) {
+            if ($this->shouldStartAdministratorLogin($app)) {
+                $this->handleAdministratorLoginStart($app);
+
+                return;
+            }
+
+            $this->deliverAdministratorUiError($app);
+
+            if ($this->shouldHandleAdministratorLogout($app)) {
+                try {
+                    $this->logFlowDebug('admin.logout.dispatch', [
+                        'user_id' => (int) $app->getIdentity()->id,
+                        'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+                    ]);
+                    $this->handleAdministratorLogout($app);
+                } catch (\Throwable $exception) {
+                    $this->logFlowDebug('admin.logout.exception', [
+                        'message' => $exception->getMessage(),
+                    ]);
+                    $app->enqueueMessage($exception->getMessage(), 'error');
+                }
+            }
+
+            return;
+        }
+
+        if (!$app->isClient('site')) {
             return;
         }
 
@@ -132,6 +167,7 @@ final class CasAuthSch extends CMSPlugin implements SubscriberInterface
         }
 
         $app->getSession()->remove(self::SESSION_UI_ERROR);
+        $app->enqueueMessage($message, 'error');
 
         $queryParamName = self::UI_ERROR_QUERY_PARAM;
         $script = <<<JS
@@ -166,7 +202,33 @@ document.addEventListener('DOMContentLoaded', function () {
             panelBody.insertBefore(alert, panelBody.firstChild);
         }
 
+        removeMatchingSystemMessages();
+
         return true;
+    }
+
+    function removeMatchingSystemMessages() {
+        var normalizedMessage = (message || '').replace(/\s+/g, ' ').trim();
+
+        if (!normalizedMessage) {
+            return;
+        }
+
+        document.querySelectorAll('#system-message-container .alert, #system-message-container joomla-alert, joomla-alert').forEach(function (node) {
+            var text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+
+            if (!text || text !== normalizedMessage) {
+                return;
+            }
+
+            node.remove();
+        });
+
+        var container = document.getElementById('system-message-container');
+
+        if (container && !(container.textContent || '').trim()) {
+            container.remove();
+        }
     }
 
     function clearMessageFromUrl() {
@@ -232,13 +294,24 @@ JS;
         }
 
         $formId = preg_replace('/[^A-Za-z0-9_-]/', '-', $event->getFormId()) ?: 'login-form';
+        $app = Factory::getApplication();
+        $adminIntent = $app instanceof CMSApplicationInterface && $app->isClient('administrator');
+        $loginUrl = $adminIntent ? $this->getAdministratorSsoKickoffUrl() : $this->getSsoLoginUrl();
+
+        $this->logFlowDebug('button.render', [
+            'form_id' => $formId,
+            'admin_intent' => $adminIntent,
+            'client' => $app instanceof CMSApplicationInterface ? ($app->isClient('administrator') ? 'administrator' : ($app->isClient('site') ? 'site' : 'other')) : 'unknown',
+            'login_url' => $loginUrl,
+        ]);
+
         $event->addResult([
             'label' => 'PLG_SYSTEM_CASAUTH_SCH_LOGIN_BUTTON_LABEL',
-            'tooltip' => 'PLG_SYSTEM_CASAUTH_SCH_LOGIN_BUTTON_DESC',
+            'tooltip' => $adminIntent ? 'PLG_SYSTEM_CASAUTH_SCH_ADMIN_LOGIN_BUTTON_DESC' : 'PLG_SYSTEM_CASAUTH_SCH_LOGIN_BUTTON_DESC',
             'id' => 'plg_system_casauth_sch-' . $formId,
             'icon' => 'icon-lock icon-fw',
             'class' => 'plg-system-casauth-sch-login-button',
-            'onclick' => "window.location.href='" . $this->getSsoLoginUrl() . "';",
+            'onclick' => "window.location.href='" . $loginUrl . "';",
         ]);
     }
 
@@ -251,7 +324,7 @@ JS;
             return;
         }
 
-        Factory::getApplication()->getSession()->set('casauth_sch.is_sso', true);
+        Factory::getApplication()->getSession()->set(self::SESSION_IS_SSO, true);
     }
 
     public function onContentPrepareData(PrepareDataEvent $event): void
@@ -423,7 +496,7 @@ JS;
         }
 
         $userId = (int) $app->getIdentity()->id;
-        $sessionIsSso = (bool) $app->getSession()->get('casauth_sch.is_sso', false);
+        $sessionIsSso = (bool) $app->getSession()->get(self::SESSION_IS_SSO, false);
         $hasStoredLink = $userId > 0 && $this->hasStoredCasLink($userId);
         $tokenValid = Session::checkToken('request');
 
@@ -469,13 +542,33 @@ JS;
         $session = $app->getSession();
         $returnTarget = '';
         $casAuthenticated = false;
+        $adminIntent = $this->captureAdministratorIntent($app);
+        $input = $app->getInput();
+
+        $this->logFlowDebug('login.start', [
+            'admin_intent' => $adminIntent,
+            'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+            'has_ticket' => trim($input->getString('ticket', '')) !== '',
+            'raw_return' => (string) $input->getInputForRequestMethod()->get('return', ''),
+            'admin_param' => $input->getInt(self::ADMIN_INTENT_QUERY_PARAM, 0),
+            'stored_return' => (string) $session->get(self::SESSION_RETURN, ''),
+        ]);
 
         try {
-            $returnTarget = $this->resolveLoginReturn($app);
+            if ($adminIntent && !$this->canUseAdministratorSso($app)) {
+                throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_ADMIN_SHARED_SESSION'));
+            }
+
+            $returnTarget = $this->resolveLoginReturn($app, $adminIntent);
 
             if ($returnTarget !== '') {
-                $session->set('casauth_sch.return', $returnTarget);
+                $session->set(self::SESSION_RETURN, $returnTarget);
             }
+
+            $this->logFlowDebug('login.return.resolved', [
+                'admin_intent' => $adminIntent,
+                'return_target' => $returnTarget,
+            ]);
 
             $this->bootPhpCas();
             \phpCAS::forceAuthentication();
@@ -485,30 +578,57 @@ JS;
             $casIdentity = $this->resolveCasIdentity($attributes, (string) \phpCAS::getUser());
             $this->logCasAttributes($attributes, $casIdentity);
             $this->assertAttributeAllowlists($attributes);
-            $localUserData = $this->ensureLocalUser($casIdentity);
-            $this->completeJoomlaLogin($app, $localUserData);
+            $localUserResolution = $this->ensureLocalUser($casIdentity, $adminIntent);
+            $localUser = $localUserResolution['user'];
+            $localUserData = $localUserResolution['login'];
+            $this->logFlowDebug('login.local_user.resolved', [
+                'admin_intent' => $adminIntent,
+                'user_id' => (int) $localUser->id,
+                'username' => (string) $localUser->username,
+                'can_login_admin' => $localUser->authorise('core.login.admin'),
+            ]);
+            $this->completeJoomlaLogin($app, $localUserData, $adminIntent);
 
-            Factory::getApplication()->getSession()->set('casauth_sch.is_sso', true);
+            Factory::getApplication()->getSession()->set(self::SESSION_IS_SSO, true);
 
-            $redirectTarget = (string) $session->get('casauth_sch.return', '');
-            $session->remove('casauth_sch.return');
+            $session->remove(self::SESSION_RETURN);
+            $session->remove(self::SESSION_ADMIN_INTENT);
+            $redirectTarget = $returnTarget;
+
+            if ($adminIntent) {
+                $this->assertLocalUserCanAccessAdministrator($localUser, true);
+                $redirectTarget = $this->normalizeAdministratorReturnTarget($redirectTarget);
+            }
+
+            $this->logFlowDebug('login.redirect.final', [
+                'admin_intent' => $adminIntent,
+                'redirect_target' => $redirectTarget,
+                'absolute_redirect' => $this->toAbsoluteUrl($redirectTarget),
+            ]);
 
             $app->redirect($this->toAbsoluteUrl($redirectTarget));
             $app->close();
         } catch (\Throwable $exception) {
-            $redirectTarget = (string) $session->get('casauth_sch.return', '');
-            $session->remove('casauth_sch.return');
+            $redirectTarget = (string) $session->get(self::SESSION_RETURN, '');
+            $session->remove(self::SESSION_RETURN);
+            $session->remove(self::SESSION_ADMIN_INTENT);
             $session->set(self::SESSION_UI_ERROR, $exception->getMessage());
-            $finalRedirect = $this->toAbsoluteUrl($redirectTarget !== '' ? $redirectTarget : $returnTarget);
+            $fallbackTarget = $redirectTarget !== '' ? $redirectTarget : $returnTarget;
+
+            if ($adminIntent) {
+                $fallbackTarget = $this->normalizeAdministratorReturnTarget($fallbackTarget);
+            }
+
+            $finalRedirect = $this->toAbsoluteUrl($fallbackTarget);
+            $finalRedirect = $this->appendUiErrorToUrl($finalRedirect, $exception->getMessage());
 
             if ($casAuthenticated) {
-                $finalRedirect = $this->appendUiErrorToUrl($finalRedirect, $exception->getMessage());
                 $this->logFlowDebug('login.failure.cas_logout', [
                     'message' => $exception->getMessage(),
                     'redirect_url' => $finalRedirect,
                 ]);
 
-                $session->remove('casauth_sch.is_sso');
+                $session->remove(self::SESSION_IS_SSO);
 
                 try {
                     $this->bootPhpCas();
@@ -520,7 +640,9 @@ JS;
                 }
             }
 
-            $app->enqueueMessage($exception->getMessage(), 'error');
+            if (!$adminIntent) {
+                $app->enqueueMessage($exception->getMessage(), 'error');
+            }
             $app->redirect($finalRedirect);
             $app->close();
         }
@@ -545,10 +667,43 @@ JS;
             throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_LOCAL_LOGOUT'));
         }
 
-        $app->getSession()->remove('casauth_sch.is_sso');
+        $app->getSession()->remove(self::SESSION_IS_SSO);
         $redirectUrl = $this->getLogoutUrl() . '?service=' . rawurlencode($this->toAbsoluteUrl($returnTarget));
 
         $this->logFlowDebug('logout.handle.redirect', [
+            'redirect_url' => $redirectUrl,
+        ]);
+
+        \phpCAS::logoutWithRedirectService($this->toAbsoluteUrl($returnTarget));
+    }
+
+    private function handleAdministratorLogout(CMSApplicationInterface $app): void
+    {
+        $input = $app->getInput()->getInputForRequestMethod();
+        $userId = $input->getInt('uid', 0);
+        $clientId = $app->get('shared_session', '0') ? null : ($userId > 0 ? 0 : 1);
+        $returnTarget = $this->normalizeAdministratorReturnTarget($this->getAdministratorEntryPath());
+
+        $this->logFlowDebug('admin.logout.handle.start', [
+            'user_id' => (int) $app->getIdentity()->id,
+            'uid' => $userId,
+            'return_target' => $returnTarget,
+            'logout_url' => $this->getLogoutUrl(),
+        ]);
+
+        $this->bootPhpCas();
+
+        if ($app->logout($userId > 0 ? $userId : null, ['clientid' => $clientId]) !== true) {
+            throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_LOCAL_LOGOUT'));
+        }
+
+        $session = $app->getSession();
+        $session->remove(self::SESSION_IS_SSO);
+        $session->remove(self::SESSION_ADMIN_INTENT);
+
+        $redirectUrl = $this->getLogoutUrl() . '?service=' . rawurlencode($this->toAbsoluteUrl($returnTarget));
+
+        $this->logFlowDebug('admin.logout.handle.redirect', [
             'redirect_url' => $redirectUrl,
         ]);
 
@@ -598,7 +753,7 @@ JS;
     {
         $app = Factory::getApplication();
 
-        if (!$app instanceof CMSApplicationInterface || !$app->isClient('site')) {
+        if (!$app instanceof CMSApplicationInterface) {
             return false;
         }
 
@@ -612,19 +767,38 @@ JS;
             return false;
         }
 
-        return $document instanceof HtmlDocument;
+        if (!$document instanceof HtmlDocument) {
+            return false;
+        }
+
+        if ($app->isClient('site')) {
+            return true;
+        }
+
+        return $app->isClient('administrator')
+            && (bool) $this->params->get('enable_admin_sso', 0)
+            && $this->canUseAdministratorSso($app);
     }
 
     private function getSsoLoginUrl(): string
     {
+        $targetUrl = Uri::getInstance($this->getServiceUrl());
         $return = Uri::getInstance()->toString(['path', 'query', 'fragment']);
-        $query = 'index.php?option=com_users&view=login&casauth_sch=1';
 
         if ($return !== '') {
-            $query .= '&return=' . rawurlencode(base64_encode($return));
+            $targetUrl->setVar('return', base64_encode($return));
         }
 
-        return Route::_($query, false);
+        return $targetUrl->toString();
+    }
+
+    private function getAdministratorSsoKickoffUrl(): string
+    {
+        $currentUrl = Uri::getInstance();
+        $currentUrl->setVar(self::ADMIN_INTENT_QUERY_PARAM, '1');
+        $currentUrl->delVar(self::UI_ERROR_QUERY_PARAM);
+
+        return $currentUrl->toString();
     }
 
     /**
@@ -682,9 +856,9 @@ JS;
     /**
      * @param   array{uid: string, email: string, fullname: string, type: string, language: string, umdobject: string}  $casIdentity
      *
-     * @return  array<string, string>
+     * @return  array{user: User, login: array<string, string>}
      */
-    private function ensureLocalUser(array $casIdentity): array
+    private function ensureLocalUser(array $casIdentity, bool $adminIntent = false): array
     {
         $userId = $this->findLinkedUserIdByCasUid($casIdentity['uid']);
 
@@ -693,10 +867,14 @@ JS;
 
             if ($user->id) {
                 $this->assertLocalUserIsActive($user);
+                $this->assertLocalUserCanAccessAdministrator($user, $adminIntent);
                 $this->syncLocalUser($user, $casIdentity);
                 $this->storeCasLinkForUser((int) $user->id, $casIdentity);
 
-                return $this->buildLoginUserData($user, $casIdentity);
+                return [
+                    'user' => $user,
+                    'login' => $this->buildLoginUserData($user, $casIdentity),
+                ];
             }
 
             $this->deleteCasProfileData($userId);
@@ -716,14 +894,22 @@ JS;
             $user = $this->loadUserById($userId);
 
             if (!$user->id) {
-                throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_USER_NOT_FOUND'));
+                throw new \RuntimeException($adminIntent ? Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_ADMIN_USER_NOT_FOUND') : Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_USER_NOT_FOUND'));
             }
 
             $this->assertLocalUserIsActive($user);
+            $this->assertLocalUserCanAccessAdministrator($user, $adminIntent);
             $this->syncLocalUser($user, $casIdentity);
             $this->storeCasLinkForUser((int) $user->id, $casIdentity);
 
-            return $this->buildLoginUserData($user, $casIdentity);
+            return [
+                'user' => $user,
+                'login' => $this->buildLoginUserData($user, $casIdentity),
+            ];
+        }
+
+        if ($adminIntent) {
+            throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_ADMIN_USER_NOT_FOUND'));
         }
 
         if (!(bool) $this->params->get('auto_create', 1)) {
@@ -733,7 +919,10 @@ JS;
         $user = $this->createLocalUser($casIdentity);
         $this->storeCasLinkForUser((int) $user->id, $casIdentity);
 
-        return $this->buildLoginUserData($user, $casIdentity);
+        return [
+            'user' => $user,
+            'login' => $this->buildLoginUserData($user, $casIdentity),
+        ];
     }
 
     /**
@@ -777,9 +966,12 @@ JS;
             return;
         }
 
+        $profile = $this->loadCasProfileData((int) $user->id);
+        $previousCasFullname = trim((string) ($profile[self::PROFILE_FIELD_FULLNAME] ?? ''));
+        $allowNameSync = $previousCasFullname === '' || $user->name === $previousCasFullname;
         $dirty = false;
 
-        if ($user->name !== $casIdentity['fullname']) {
+        if ($allowNameSync && $user->name !== $casIdentity['fullname']) {
             $user->set('name', $casIdentity['fullname']);
             $dirty = true;
         }
@@ -1061,6 +1253,17 @@ JS;
         }
     }
 
+    private function assertLocalUserCanAccessAdministrator(User $user, bool $adminIntent): void
+    {
+        if (!$adminIntent) {
+            return;
+        }
+
+        if (!$user->authorise('core.login.admin')) {
+            throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_ADMIN_ACCESS_DENIED'));
+        }
+    }
+
     private function findAvailableUsername(string $casUid): string
     {
         $base = $this->sanitizeLocalUsername($casUid);
@@ -1076,10 +1279,33 @@ JS;
         }
 
         foreach ($candidates as $candidate) {
-            if (UserHelper::getUserId($candidate) === 0) {
+            $candidate = substr($candidate, 0, 100);
+
+            if ($candidate !== '' && (int) UserHelper::getUserId($candidate) === 0) {
                 return $candidate;
             }
         }
+
+        // Final fallback: allocate a short random-safe username instead of failing on
+        // unexpected collisions across the conservative candidate list above.
+        for ($i = 0; $i < 20; $i++) {
+            $candidate = substr($suffixBase . '-' . bin2hex(random_bytes(4)), 0, 100);
+
+            if ((int) UserHelper::getUserId($candidate) === 0) {
+                $this->logFlowDebug('username.allocate.random_fallback', [
+                    'cas_uid' => $casUid,
+                    'candidate' => $candidate,
+                ]);
+
+                return $candidate;
+            }
+        }
+
+        $this->logFlowDebug('username.allocate.exhausted', [
+            'cas_uid' => $casUid,
+            'base' => $base,
+            'suffix_base' => $suffixBase,
+        ]);
 
         throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_USERNAME_UNAVAILABLE'));
     }
@@ -1215,10 +1441,16 @@ JS;
     /**
      * @param   array<string, string>  $userData
      */
-    private function completeJoomlaLogin(CMSApplicationInterface $app, array $userData): void
+    private function completeJoomlaLogin(CMSApplicationInterface $app, array $userData, bool $adminIntent = false): void
     {
         $dispatcher = $app->getDispatcher();
-        $options = ['action' => 'core.login.site'];
+        $options = ['action' => $adminIntent ? 'core.login.admin' : 'core.login.site'];
+
+        $this->logFlowDebug('login.local.dispatch', [
+            'admin_intent' => $adminIntent,
+            'action' => $options['action'],
+            'username' => (string) ($userData['username'] ?? ''),
+        ]);
 
         PluginHelper::importPlugin('user', null, true, $dispatcher);
 
@@ -1226,6 +1458,12 @@ JS;
         $dispatcher->dispatch('onUserLogin', $loginEvent);
 
         $results = $loginEvent['result'] ?? [];
+
+        $this->logFlowDebug('login.local.result', [
+            'admin_intent' => $adminIntent,
+            'action' => $options['action'],
+            'results' => $results,
+        ]);
 
         if (\in_array(false, $results, true)) {
             $dispatcher->dispatch('onUserLoginFailure', new LoginFailureEvent('onUserLoginFailure', [
@@ -1245,20 +1483,30 @@ JS;
         ]));
     }
 
-    private function resolveLoginReturn(CMSApplicationInterface $app): string
+    private function resolveLoginReturn(CMSApplicationInterface $app, bool $adminIntent = false): string
     {
         $input = $app->getInput();
         $session = $app->getSession();
+        $isCasCallback = trim($input->getString('ticket', '')) !== '';
 
-        if ($input->getInt('casauth_sch', 0) === 1) {
-            $stored = (string) $session->get('casauth_sch.return', '');
+        if ($input->getInt('casauth_sch', 0) === 1 && $isCasCallback) {
+            $stored = (string) $session->get(self::SESSION_RETURN, '');
 
-            return $stored !== '' ? $stored : Uri::root();
+            if ($stored !== '') {
+                return $stored;
+            }
         }
 
         $rawReturn = $input->getInputForRequestMethod()->get('return', '', 'BASE64');
         $decodedReturn = base64_decode((string) $rawReturn, true);
         $normalizedReturn = $this->normalizeReturn($app, $decodedReturn === false ? '' : $decodedReturn);
+
+        if ($adminIntent) {
+            $normalizedReturn = $this->normalizeAdministratorReturnTarget($normalizedReturn);
+
+            return $normalizedReturn !== '' ? $normalizedReturn : $this->getAdministratorEntryPath();
+        }
+
         $normalizedReturn = $this->sanitizeSsoReturnTarget($normalizedReturn);
 
         if ($normalizedReturn !== '') {
@@ -1516,16 +1764,32 @@ JS;
     {
         $fallbackGroupId = (int) $this->params->get('default_group', 2);
         $umdobject = trim((string) ($casIdentity['umdobject'] ?? ''));
+        $mappings = $this->getUmdobjectGroupMappings();
 
         if ($umdobject === '') {
+            $this->logFlowDebug('group.resolve.no_umdobject', [
+                'fallback_group_id' => $fallbackGroupId,
+            ]);
+
             return $fallbackGroupId;
         }
 
-        foreach ($this->getUmdobjectGroupMappings() as $mapping) {
+        foreach ($mappings as $mapping) {
             if (strcasecmp($mapping['umdobject'], $umdobject) === 0) {
+                $this->logFlowDebug('group.resolve.match', [
+                    'umdobject' => $umdobject,
+                    'group_id' => $mapping['group_id'],
+                ]);
+
                 return $mapping['group_id'];
             }
         }
+
+        $this->logFlowDebug('group.resolve.fallback', [
+            'umdobject' => $umdobject,
+            'fallback_group_id' => $fallbackGroupId,
+            'mappings' => $mappings,
+        ]);
 
         return $fallbackGroupId;
     }
@@ -1542,8 +1806,19 @@ JS;
             $rawMappings = is_array($decoded) ? $decoded : [];
         }
 
+        if (is_object($rawMappings)) {
+            $rawMappings = (array) $rawMappings;
+        }
+
         if (!is_array($rawMappings)) {
             return [];
+        }
+
+        if (
+            array_key_exists('umdobject', $rawMappings)
+            || array_key_exists('group_id', $rawMappings)
+        ) {
+            $rawMappings = [$rawMappings];
         }
 
         $mappings = [];
@@ -1558,7 +1833,7 @@ JS;
             }
 
             $umdobject = trim((string) ArrayHelper::getValue($mapping, 'umdobject', ''));
-            $groupId = (int) ArrayHelper::getValue($mapping, 'group_id', 0, 'int');
+            $groupId = $this->normalizeMappedGroupId(ArrayHelper::getValue($mapping, 'group_id', 0));
 
             if ($umdobject === '' || $groupId <= 0) {
                 continue;
@@ -1571,6 +1846,25 @@ JS;
         }
 
         return $mappings;
+    }
+
+    private function normalizeMappedGroupId(mixed $value): int
+    {
+        if (is_object($value)) {
+            $value = (array) $value;
+        }
+
+        if (is_array($value)) {
+            foreach (['value', 'id', 0] as $candidateKey) {
+                if (array_key_exists($candidateKey, $value)) {
+                    return (int) $value[$candidateKey];
+                }
+            }
+
+            return 0;
+        }
+
+        return (int) $value;
     }
 
     private function getUserIdFromFormData(mixed $data): int
@@ -1604,6 +1898,216 @@ JS;
         }
 
         return null;
+    }
+
+    private function canUseAdministratorSso(CMSApplicationInterface $app): bool
+    {
+        return (bool) $app->get('shared_session', '0');
+    }
+
+    private function shouldStartAdministratorLogin(CMSApplicationInterface $app): bool
+    {
+        if (
+            !$app->isClient('administrator')
+            || !$app->getIdentity()->guest
+            || !(bool) $this->params->get('enable_admin_sso', 0)
+            || !$this->canUseAdministratorSso($app)
+        ) {
+            return false;
+        }
+
+        return $app->getInput()->getInt(self::ADMIN_INTENT_QUERY_PARAM, 0) === 1;
+    }
+
+    private function handleAdministratorLoginStart(CMSApplicationInterface $app): void
+    {
+        $session = $app->getSession();
+        $input = $app->getInput();
+        $currentUri = Uri::getInstance();
+        $currentUri->delVar(self::ADMIN_INTENT_QUERY_PARAM);
+        $currentUri->delVar(self::UI_ERROR_QUERY_PARAM);
+
+        $rawReturn = $input->getInputForRequestMethod()->get('return', '', 'BASE64');
+        $decodedReturn = base64_decode((string) $rawReturn, true);
+        $requestedReturn = $decodedReturn === false
+            ? $currentUri->toString(['path', 'query', 'fragment'])
+            : $decodedReturn;
+        $returnTarget = $this->normalizeAdministratorReturnTarget($requestedReturn);
+
+        $session->set(self::SESSION_ADMIN_INTENT, true);
+        $session->set(self::SESSION_RETURN, $returnTarget);
+
+        $redirectUrl = $this->getServiceUrl();
+
+        $this->logFlowDebug('admin.intent.start', [
+            'requested_return' => $requestedReturn,
+            'stored_return' => $returnTarget,
+            'redirect_url' => $redirectUrl,
+            'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+        ]);
+
+        $app->redirect($redirectUrl);
+        $app->close();
+    }
+
+    private function captureAdministratorIntent(CMSApplicationInterface $app): bool
+    {
+        $session = $app->getSession();
+        $enabled = (bool) $this->params->get('enable_admin_sso', 0);
+        $input = $app->getInput();
+        $isCasCallback = trim($input->getString('ticket', '')) !== '';
+        $isSiteCallback = $input->getInt('casauth_sch', 0) === 1;
+
+        if (!$enabled) {
+            $session->remove(self::SESSION_ADMIN_INTENT);
+
+            return false;
+        }
+
+        if ($input->getInt(self::ADMIN_INTENT_QUERY_PARAM, 0) === 1) {
+            $session->set(self::SESSION_ADMIN_INTENT, true);
+        }
+
+        $intent = (bool) $session->get(self::SESSION_ADMIN_INTENT, false);
+
+        $this->logFlowDebug('admin.intent.capture', [
+            'enabled' => $enabled,
+            'is_callback' => $isCasCallback,
+            'is_site_callback' => $isSiteCallback,
+            'admin_param' => $input->getInt(self::ADMIN_INTENT_QUERY_PARAM, 0),
+            'intent' => $intent,
+            'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+        ]);
+
+        return $intent;
+    }
+
+    private function shouldHandleAdministratorLogout(CMSApplicationInterface $app): bool
+    {
+        if (!$app->isClient('administrator')) {
+            return false;
+        }
+
+        $input = $app->getInput()->getInputForRequestMethod();
+        $option = $input->getCmd('option');
+        $task = $input->getCmd('task');
+        $looksLikeLogoutRequest = $option === 'com_login' && $task === 'logout';
+
+        if (!$looksLikeLogoutRequest) {
+            return false;
+        }
+
+        $userId = (int) $app->getIdentity()->id;
+        $sessionIsSso = (bool) $app->getSession()->get(self::SESSION_IS_SSO, false);
+        $hasStoredLink = $userId > 0 && $this->hasStoredCasLink($userId);
+        $tokenValid = Session::checkToken('request');
+
+        $this->logFlowDebug('admin.logout.request', [
+            'method' => $_SERVER['REQUEST_METHOD'] ?? '',
+            'option' => $option,
+            'task' => $task,
+            'user_id' => $userId,
+            'identity_guest' => $app->getIdentity()->guest,
+            'session_is_sso' => $sessionIsSso,
+            'has_stored_cas_link' => $hasStoredLink,
+            'token_valid' => $tokenValid,
+            'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+        ]);
+
+        if (!$tokenValid) {
+            return false;
+        }
+
+        return $sessionIsSso || $hasStoredLink;
+    }
+
+    private function deliverAdministratorUiError(CMSApplicationInterface $app): void
+    {
+        if (!$app->isClient('administrator')) {
+            return;
+        }
+
+        $input = $app->getInput();
+        $rawMessage = $input->getString(self::UI_ERROR_QUERY_PARAM, '');
+
+        if ($rawMessage !== '') {
+            $decodedMessage = base64_decode(strtr($rawMessage, ' ', '+'), true);
+
+            if ($decodedMessage !== false && trim($decodedMessage) !== '') {
+                $app->getSession()->set(self::SESSION_UI_ERROR, trim($decodedMessage));
+            }
+
+            $currentUri = Uri::getInstance();
+            $currentUri->delVar(self::UI_ERROR_QUERY_PARAM);
+            $app->redirect($currentUri->toString());
+            $app->close();
+        }
+
+        $message = trim((string) $app->getSession()->get(self::SESSION_UI_ERROR, ''));
+
+        if ($message !== '') {
+            $app->getSession()->remove(self::SESSION_UI_ERROR);
+            $app->enqueueMessage($message, 'error');
+        }
+    }
+
+    private function getAdministratorEntryPath(): string
+    {
+        $parts = parse_url($this->getServiceUrl());
+        $path = (string) ($parts['path'] ?? '/index.php');
+        $basePath = str_replace('\\', '/', dirname($path));
+
+        if ($basePath === '.' || $basePath === '/' || $basePath === '\\') {
+            $basePath = '';
+        }
+
+        return rtrim($basePath, '/') . '/administrator/index.php';
+    }
+
+    private function normalizeAdministratorReturnTarget(string $return): string
+    {
+        $return = trim($return);
+
+        if ($return === '') {
+            return $this->getAdministratorEntryPath();
+        }
+
+        if (filter_var($return, FILTER_VALIDATE_URL)) {
+            $parts = parse_url($return);
+
+            if ($parts === false) {
+                return $this->getAdministratorEntryPath();
+            }
+
+            $return = (string) ($parts['path'] ?? '');
+
+            if (!empty($parts['query'])) {
+                $return .= '?' . $parts['query'];
+            }
+
+            if (!empty($parts['fragment'])) {
+                $return .= '#' . $parts['fragment'];
+            }
+        }
+
+        if (!Uri::isInternal($return)) {
+            return $this->getAdministratorEntryPath();
+        }
+
+        $normalized = ltrim($return, '/');
+
+        if (!str_starts_with($normalized, 'administrator')) {
+            return $this->getAdministratorEntryPath();
+        }
+
+        if (
+            stripos($return, 'option=com_login') !== false
+            || stripos($return, 'task=logout') !== false
+        ) {
+            return $this->getAdministratorEntryPath();
+        }
+
+        return $return;
     }
 
     private function isAdministratorProfileContext(): bool
