@@ -54,8 +54,11 @@ final class CasAuthSch extends CMSPlugin implements SubscriberInterface
     private const SESSION_RETURN = 'casauth_sch.return';
     private const SESSION_IS_SSO = 'casauth_sch.is_sso';
     private const SESSION_ADMIN_INTENT = 'casauth_sch.admin_intent';
+    private const SESSION_SOFT_LOGOUT = 'casauth_sch.soft_logout';
     private const UI_ERROR_QUERY_PARAM = 'casauth_sch_ui_error';
+    private const UI_MESSAGES_QUERY_PARAM = 'casauth_sch_ui_messages';
     private const ADMIN_INTENT_QUERY_PARAM = 'casauth_sch_admin';
+    private const SOFT_LOGOUT_QUERY_PARAM = 'casauth_sch_soft_logout';
 
     private static bool $loggerConfigured = false;
 
@@ -114,6 +117,8 @@ final class CasAuthSch extends CMSPlugin implements SubscriberInterface
             return;
         }
 
+        $this->deliverTransferredUiMessages($app);
+
         if ($this->shouldHandleLogout($app)) {
             try {
                 $this->logFlowDebug('logout.dispatch', [
@@ -149,6 +154,10 @@ final class CasAuthSch extends CMSPlugin implements SubscriberInterface
             || !$document instanceof HtmlDocument
         ) {
             return;
+        }
+
+        if ($app->getInput()->getString(self::UI_MESSAGES_QUERY_PARAM, '') !== '') {
+            $this->addQueryCleanupScript($document, [self::UI_MESSAGES_QUERY_PARAM]);
         }
 
         $message = (string) $app->getSession()->get(self::SESSION_UI_ERROR, '');
@@ -486,12 +495,58 @@ JS;
 
     private function shouldHandleLogout(CMSApplicationInterface $app): bool
     {
-        $input = $app->getInput()->getInputForRequestMethod();
+        $input = $app->getInput();
+        $methodInput = $input->getInputForRequestMethod();
         $option = $input->getCmd('option');
         $task = $input->getCmd('task');
-        $looksLikeLogoutRequest = $option === 'com_users' && \in_array($task, ['user.logout', 'user.menulogout'], true);
+        $view = $input->getCmd('view');
+        $layout = $input->getCmd('layout');
+        $isMenuLogout = $task === 'user.menulogout'
+            || ($option === 'com_users' && $view === 'login' && $layout === 'logout');
+        $looksLikeLogoutRequest = $option === 'com_users'
+            && (\in_array($task, ['user.logout', 'user.menulogout'], true) || $isMenuLogout);
+        $softLogout = $this->hasSoftLogoutFlag($app);
+        $sessionSoftLogout = (bool) $app->getSession()->get(self::SESSION_SOFT_LOGOUT, false);
 
         if (!$looksLikeLogoutRequest) {
+            $this->logIgnoredLogoutRoute($app);
+
+            return false;
+        }
+
+        if ($softLogout) {
+            $app->getSession()->set(self::SESSION_SOFT_LOGOUT, true);
+
+            $this->logFlowDebug('logout.soft_skip', [
+                'method' => $_SERVER['REQUEST_METHOD'] ?? '',
+                'option' => $option,
+                'task' => $task,
+                'view' => $view,
+                'layout' => $layout,
+                'user_id' => (int) $app->getIdentity()->id,
+                'query_flag' => $softLogout,
+                'session_flag' => $sessionSoftLogout,
+                'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+            ]);
+
+            return false;
+        }
+
+        if ($sessionSoftLogout) {
+            $app->getSession()->remove(self::SESSION_SOFT_LOGOUT);
+
+            $this->logFlowDebug('logout.soft_skip', [
+                'method' => $_SERVER['REQUEST_METHOD'] ?? '',
+                'option' => $option,
+                'task' => $task,
+                'view' => $view,
+                'layout' => $layout,
+                'user_id' => (int) $app->getIdentity()->id,
+                'query_flag' => false,
+                'session_flag' => true,
+                'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+            ]);
+
             return false;
         }
 
@@ -504,16 +559,20 @@ JS;
             'method' => $_SERVER['REQUEST_METHOD'] ?? '',
             'option' => $option,
             'task' => $task,
+            'view' => $view,
+            'layout' => $layout,
             'user_id' => $userId,
             'identity_guest' => $app->getIdentity()->guest,
             'session_is_sso' => $sessionIsSso,
             'has_stored_cas_link' => $hasStoredLink,
             'token_valid' => $tokenValid,
+            'menu_logout' => $isMenuLogout,
+            'soft_logout' => $softLogout,
             'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
-            'return' => (string) $input->get('return', ''),
+            'return' => (string) $methodInput->get('return', ''),
         ]);
 
-        if (!$tokenValid) {
+        if (!$tokenValid && !$isMenuLogout) {
             return false;
         }
 
@@ -526,15 +585,69 @@ JS;
 
     private function isCurrentRequestSiteLogout(CMSApplicationInterface $app): bool
     {
-        $input = $app->getInput()->getInputForRequestMethod();
+        $input = $app->getInput();
         $option = $input->getCmd('option');
         $task = $input->getCmd('task');
+        $view = $input->getCmd('view');
+        $layout = $input->getCmd('layout');
 
         if ($option !== 'com_users') {
             return false;
         }
 
-        return \in_array($task, ['user.logout', 'user.menulogout'], true);
+        return \in_array($task, ['user.logout', 'user.menulogout'], true)
+            || ($view === 'login' && $layout === 'logout');
+    }
+
+    private function logIgnoredLogoutRoute(CMSApplicationInterface $app): void
+    {
+        if (!(bool) $this->params->get('log_cas_attributes', 0)) {
+            return;
+        }
+
+        $identity = $app->getIdentity();
+
+        if ($identity->guest) {
+            return;
+        }
+
+        $input = $app->getInput();
+
+        $this->logFlowDebug('logout.ignored_route', [
+            'method' => $_SERVER['REQUEST_METHOD'] ?? '',
+            'option' => $input->getCmd('option'),
+            'task' => $input->getCmd('task'),
+            'view' => $input->getCmd('view'),
+            'layout' => $input->getCmd('layout'),
+            'user_id' => (int) $identity->id,
+            'session_is_sso' => (bool) $app->getSession()->get(self::SESSION_IS_SSO, false),
+            'has_stored_cas_link' => (int) $identity->id > 0 && $this->hasStoredCasLink((int) $identity->id),
+            'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+        ]);
+    }
+
+    private function hasSoftLogoutFlag(CMSApplicationInterface $app): bool
+    {
+        $input = $app->getInput();
+        $methodInput = $input->getInputForRequestMethod();
+
+        if (
+            $input->getInt(self::SOFT_LOGOUT_QUERY_PARAM, 0) === 1
+            || $methodInput->getInt(self::SOFT_LOGOUT_QUERY_PARAM, 0) === 1
+        ) {
+            return true;
+        }
+
+        $requestUri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+        $query = (string) (parse_url($requestUri, PHP_URL_QUERY) ?: '');
+
+        if ($query === '') {
+            return false;
+        }
+
+        parse_str($query, $queryVars);
+
+        return (string) ($queryVars[self::SOFT_LOGOUT_QUERY_PARAM] ?? '') === '1';
     }
 
     private function handleLogin(CMSApplicationInterface $app): void
@@ -667,14 +780,18 @@ JS;
             throw new \RuntimeException(Text::_('PLG_SYSTEM_CASAUTH_SCH_ERROR_LOCAL_LOGOUT'));
         }
 
+        $this->enqueueDefaultFrontendLogoutMessage($app);
+        $returnUrl = $this->toAbsoluteUrl($returnTarget);
+        $returnUrl = $this->appendTransferredMessageQueueToUrl($app, $returnUrl);
         $app->getSession()->remove(self::SESSION_IS_SSO);
-        $redirectUrl = $this->getLogoutUrl() . '?service=' . rawurlencode($this->toAbsoluteUrl($returnTarget));
+        $app->getSession()->remove(self::SESSION_SOFT_LOGOUT);
+        $redirectUrl = $this->getLogoutUrl() . '?service=' . rawurlencode($returnUrl);
 
         $this->logFlowDebug('logout.handle.redirect', [
             'redirect_url' => $redirectUrl,
         ]);
 
-        \phpCAS::logoutWithRedirectService($this->toAbsoluteUrl($returnTarget));
+        \phpCAS::logoutWithRedirectService($returnUrl);
     }
 
     private function handleAdministratorLogout(CMSApplicationInterface $app): void
@@ -700,6 +817,7 @@ JS;
         $session = $app->getSession();
         $session->remove(self::SESSION_IS_SSO);
         $session->remove(self::SESSION_ADMIN_INTENT);
+        $session->remove(self::SESSION_SOFT_LOGOUT);
 
         $redirectUrl = $this->getLogoutUrl() . '?service=' . rawurlencode($this->toAbsoluteUrl($returnTarget));
 
@@ -783,7 +901,7 @@ JS;
     private function getSsoLoginUrl(): string
     {
         $targetUrl = Uri::getInstance($this->getServiceUrl());
-        $return = Uri::getInstance()->toString(['path', 'query', 'fragment']);
+        $return = $this->stripInternalUiQueryParams(Uri::getInstance()->toString(['path', 'query', 'fragment']));
 
         if ($return !== '') {
             $targetUrl->setVar('return', base64_encode($return));
@@ -1340,6 +1458,182 @@ JS;
         return $uri->toString();
     }
 
+    private function appendTransferredMessageQueueToUrl(CMSApplicationInterface $app, string $target): string
+    {
+        $messages = $this->getTransferableMessageQueue($app);
+
+        if ($target === '' || $messages === []) {
+            return $target;
+        }
+
+        $payload = json_encode($messages, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        if ($payload === false || $payload === '') {
+            return $target;
+        }
+
+        $uri = Uri::getInstance($target);
+        $uri->setVar(self::UI_MESSAGES_QUERY_PARAM, base64_encode($payload));
+
+        return $uri->toString();
+    }
+
+    /**
+     * @return  array<int, array{message: string, type: string}>
+     */
+    private function getTransferableMessageQueue(CMSApplicationInterface $app): array
+    {
+        if (!method_exists($app, 'getMessageQueue')) {
+            return [];
+        }
+
+        $messages = $app->getMessageQueue();
+
+        if (!is_array($messages)) {
+            return [];
+        }
+
+        $transferable = [];
+
+        foreach ($messages as $message) {
+            if (!is_array($message)) {
+                continue;
+            }
+
+            $text = trim((string) ($message['message'] ?? ''));
+            $type = strtolower(trim((string) ($message['type'] ?? 'message')));
+
+            if ($text === '' || \in_array($type, ['error', 'danger'], true)) {
+                continue;
+            }
+
+            $transferable[] = [
+                'message' => $text,
+                'type' => $type !== '' ? $type : 'message',
+            ];
+        }
+
+        return $transferable;
+    }
+
+    private function enqueueDefaultFrontendLogoutMessage(CMSApplicationInterface $app): void
+    {
+        if ($this->getTransferableMessageQueue($app) !== []) {
+            return;
+        }
+
+        Factory::getLanguage()->load('com_users', JPATH_SITE);
+
+        $message = Text::_('COM_USERS_FRONTEND_LOGOUT_SUCCESS');
+
+        if ($message === '' || $message === 'COM_USERS_FRONTEND_LOGOUT_SUCCESS') {
+            return;
+        }
+
+        $app->enqueueMessage($message, 'message');
+    }
+
+    private function deliverTransferredUiMessages(CMSApplicationInterface $app): bool
+    {
+        $rawMessages = $app->getInput()->getString(self::UI_MESSAGES_QUERY_PARAM, '');
+
+        if ($rawMessages === '') {
+            return false;
+        }
+
+        $decodedMessages = base64_decode(strtr($rawMessages, ' ', '+'), true);
+
+        if ($decodedMessages === false || $decodedMessages === '') {
+            return false;
+        }
+
+        $messages = json_decode($decodedMessages, true);
+
+        if (!is_array($messages)) {
+            return false;
+        }
+
+        $delivered = false;
+
+        foreach ($messages as $message) {
+            if (!is_array($message)) {
+                continue;
+            }
+
+            $text = trim((string) ($message['message'] ?? ''));
+            $type = strtolower(trim((string) ($message['type'] ?? 'message')));
+
+            if ($text === '') {
+                continue;
+            }
+
+            if (!preg_match('/^[a-z][a-z0-9_-]*$/', $type)) {
+                $type = 'message';
+            }
+
+            $app->enqueueMessage($text, $type !== '' ? $type : 'message');
+            $delivered = true;
+        }
+
+        if ($delivered) {
+            $this->logFlowDebug('ui.messages.delivered', [
+                'count' => \count($messages),
+                'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+            ]);
+        }
+
+        return $delivered;
+    }
+
+    /**
+     * @param   array<int, string>  $queryParamNames
+     */
+    private function addQueryCleanupScript(HtmlDocument $document, array $queryParamNames): void
+    {
+        $queryParamNames = array_values(array_unique(array_filter(
+            array_map(
+                static fn (string $name): string => trim($name),
+                $queryParamNames
+            ),
+            static fn (string $name): bool => $name !== ''
+        )));
+
+        if ($queryParamNames === []) {
+            return;
+        }
+
+        $script = <<<JS
+document.addEventListener('DOMContentLoaded', function () {
+    var queryParamNames = %s;
+
+    try {
+        var url = new URL(window.location.href);
+        var changed = false;
+
+        queryParamNames.forEach(function (name) {
+            if (!url.searchParams.has(name)) {
+                return;
+            }
+
+            url.searchParams.delete(name);
+            changed = true;
+        });
+
+        if (changed) {
+            window.history.replaceState({}, document.title, url.toString());
+        }
+    } catch (error) {
+        // Ignore URL cleanup failures.
+    }
+});
+JS;
+
+        $document->addScriptDeclaration(sprintf(
+            $script,
+            json_encode($queryParamNames, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+        ));
+    }
+
     /**
      * @param   array<string, mixed>  $attributes
      * @param   array{uid: string, email: string, fullname: string, type: string, language: string}  $casIdentity
@@ -1560,6 +1854,12 @@ JS;
             return '';
         }
 
+        $return = $this->stripInternalUiQueryParams($return);
+
+        if ($return === '') {
+            return '';
+        }
+
         if (
             stripos($return, 'option=com_users') !== false
             && stripos($return, 'view=login') !== false
@@ -1568,6 +1868,78 @@ JS;
         }
 
         return $return;
+    }
+
+    private function stripInternalUiQueryParams(string $target): string
+    {
+        $target = trim($target);
+
+        if ($target === '') {
+            return '';
+        }
+
+        $parts = parse_url($target);
+
+        if ($parts === false || !isset($parts['query'])) {
+            return $target;
+        }
+
+        parse_str((string) $parts['query'], $queryVars);
+
+        $changed = false;
+
+        foreach ([self::UI_ERROR_QUERY_PARAM, self::UI_MESSAGES_QUERY_PARAM] as $paramName) {
+            if (array_key_exists($paramName, $queryVars)) {
+                unset($queryVars[$paramName]);
+                $changed = true;
+            }
+        }
+
+        if (!$changed) {
+            return $target;
+        }
+
+        $rebuilt = '';
+
+        if (isset($parts['scheme'])) {
+            $rebuilt .= $parts['scheme'] . ':';
+        }
+
+        if (isset($parts['host'])) {
+            $rebuilt .= '//';
+
+            if (isset($parts['user'])) {
+                $rebuilt .= $parts['user'];
+
+                if (isset($parts['pass'])) {
+                    $rebuilt .= ':' . $parts['pass'];
+                }
+
+                $rebuilt .= '@';
+            }
+
+            $rebuilt .= $parts['host'];
+
+            if (isset($parts['port'])) {
+                $rebuilt .= ':' . $parts['port'];
+            }
+        }
+
+        $rebuilt .= $parts['path'] ?? '';
+
+        $queryString = http_build_query($queryVars, '', '&', PHP_QUERY_RFC3986);
+
+        if ($queryString !== '') {
+            $rebuilt .= '?' . $queryString;
+        } elseif ($rebuilt === '' && !isset($parts['scheme'], $parts['host'], $parts['path'])) {
+            $rebuilt = '';
+        }
+
+        if (isset($parts['fragment'])) {
+            $rebuilt .= '#' . $parts['fragment'];
+        }
+
+        return $rebuilt;
     }
 
     private function getServiceUrl(): string

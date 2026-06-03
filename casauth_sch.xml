@@ -3,7 +3,7 @@
     <name>PLG_SYSTEM_CASAUTH_SCH</name>
     <author>Andreas Kontarinis &amp; ChatGPT</author>
     <creationDate>2025-09-26</creationDate>
-    <version>1.4.6</version>
+    <version>1.4.9</version>
     <description>PLG_SYSTEM_CASAUTH_SCH_XML_DESCRIPTION</description>
     <element>casauth_sch</element>
     <namespace path="src">SuperSoft\Plugin\System\CasAuthSch</namespace>
